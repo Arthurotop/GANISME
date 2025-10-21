@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 import math
 
 import matplotlib.pyplot as plt
@@ -78,6 +78,9 @@ class ArtGANTrainer:
         self._es_best: Optional[float] = None
         self._es_wait = 0
         self._es_best_epoch = -1
+
+        self._last_generator_optimizer_state: Optional[Dict[str, Any]] = None
+        self._last_discriminator_optimizer_state: Optional[Dict[str, Any]] = None
 
         self.generator: nn.Module
         self.discriminator: nn.Module
@@ -388,6 +391,9 @@ class ArtGANTrainer:
                     )
                     break
 
+        self._last_generator_optimizer_state = g_optimizer.state_dict()
+        self._last_discriminator_optimizer_state = d_optimizer.state_dict()
+
         return self.history
 
     # region training steps ------------------------------------------------
@@ -563,19 +569,7 @@ class ArtGANTrainer:
         return float(fid_value), float(inception_mean.item())
 
     def sample(self, num_samples: int) -> torch.Tensor:
-        self.generator.eval()
-        with torch.no_grad():
-            latent = torch.randn(num_samples, self.latent_dim, device=self.device)
-            if self.mode == "basic":
-                generated = self.generator(latent).view(
-                    num_samples, self.channels, self.image_size, self.image_size
-                )
-            else:
-                generated = self.generator(
-                    latent.view(latent.size(0), self.latent_dim, 1, 1)
-                )
-        self.generator.train()
-        return generated
+        return self.generate(num_samples=num_samples, return_on_cpu=False)
 
     def _ensure_range(self, tensor: torch.Tensor) -> torch.Tensor:
         if tensor.min() >= 0.0 and tensor.max() <= 1.0:
@@ -610,6 +604,47 @@ class ArtGANTrainer:
         self._es_wait += 1
         return self._es_wait >= self.early_stopping_patience
 
+    def _sample_generator_noise(self, batch_size: int) -> torch.Tensor:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be a positive integer.")
+        if self.mode == "basic":
+            return torch.randn(batch_size, self.latent_dim, device=self.device)
+        return torch.randn(batch_size, self.latent_dim, 1, 1, device=self.device)
+
+    def _generate_from_noise(self, noise: torch.Tensor) -> torch.Tensor:
+        batch_size = noise.size(0)
+        noise = noise.to(self.device)
+
+        if self.mode == "basic":
+            if noise.dim() != 2 or noise.size(1) != self.latent_dim:
+                raise ValueError(
+                    f"Expected noise of shape (batch, {self.latent_dim}) for basic mode; "
+                    f"got {tuple(noise.shape)}."
+                )
+            generated = self.generator(noise)
+            return generated.view(batch_size, self.channels, self.image_size, self.image_size)
+
+        if noise.dim() == 2:
+            if noise.size(1) != self.latent_dim:
+                raise ValueError(
+                    f"Noise second dimension must equal latent_dim ({self.latent_dim})."
+                )
+            noise = noise.view(batch_size, self.latent_dim, 1, 1)
+        elif noise.dim() == 4:
+            expected = (self.latent_dim, 1, 1)
+            if noise.shape[1:] != expected:
+                raise ValueError(
+                    f"Expected noise of shape (batch, {expected[0]}, {expected[1]}, {expected[2]}). "
+                    f"Got {tuple(noise.shape)}."
+                )
+        else:
+            raise ValueError(
+                "Noise must be either 2-D (batch, latent_dim) or 4-D "
+                "(batch, latent_dim, 1, 1) for convolutional modes."
+            )
+
+        return self.generator(noise)
+
     def save_checkpoint(self, path: str, include_optimizers: bool = False) -> None:
         checkpoint = {
             "mode": self.mode,
@@ -632,11 +667,55 @@ class ArtGANTrainer:
             "fid_samples": self.fid_samples,
         }
 
+        if include_optimizers:
+            if (
+                self._last_generator_optimizer_state is None
+                or self._last_discriminator_optimizer_state is None
+            ):
+                raise RuntimeError(
+                    "Optimizer states requested for saving but unavailable. "
+                    "Train the model or set `include_optimizers=False`."
+                )
+
+            checkpoint["optimizers"] = {
+                "generator": self._last_generator_optimizer_state,
+                "discriminator": self._last_discriminator_optimizer_state,
+            }
+
         torch.save(checkpoint, path)
 
     def load_checkpoint(self, path: str, strict: bool = True) -> None:
         checkpoint = torch.load(path, map_location=self.device)
+        self._load_checkpoint_dict(checkpoint, strict=strict)
 
+    @classmethod
+    def from_checkpoint(
+        cls,
+        path: str,
+        device: Optional[str] = None,
+        strict: bool = True,
+    ) -> "ArtGANTrainer":
+        resolved_device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        try:
+            map_location = torch.device(resolved_device)
+        except (RuntimeError, ValueError):
+            map_location = torch.device("cpu")
+            resolved_device = "cpu"
+
+        checkpoint = torch.load(path, map_location=map_location)
+        trainer = cls(
+            mode=checkpoint.get("mode", "basic"),
+            image_size=checkpoint.get("image_size", 64),
+            channels=checkpoint.get("channels", 3),
+            latent_dim=checkpoint.get("latent_dim", 128),
+            device=resolved_device,
+            fid_every=checkpoint.get("fid_every", 1),
+            fid_samples=checkpoint.get("fid_samples", 512),
+        )
+        trainer._load_checkpoint_dict(checkpoint, strict=strict)
+        return trainer
+
+    def _load_checkpoint_dict(self, checkpoint: Dict[str, Any], strict: bool) -> None:
         required_keys = {
             "mode",
             "image_size",
@@ -681,6 +760,86 @@ class ArtGANTrainer:
             self._es_best = es_state.get("best")
             self._es_best_epoch = es_state.get("best_epoch", -1)
             self._es_wait = es_state.get("wait", 0)
+
+        optim_state = checkpoint.get("optimizers")
+        if isinstance(optim_state, dict):
+            self._last_generator_optimizer_state = optim_state.get("generator")
+            self._last_discriminator_optimizer_state = optim_state.get("discriminator")
+
+    def generate(
+        self,
+        num_samples: int,
+        batch_size: Optional[int] = None,
+        noise: Optional[torch.Tensor] = None,
+        denormalize: bool = False,
+        return_on_cpu: bool = True,
+    ) -> torch.Tensor:
+        """
+        Create new images from the trained generator.
+
+        Parameters
+        ----------
+        num_samples: int
+            Number of images to produce when `noise` is not provided.
+        batch_size: Optional[int]
+            Batch size to use during generation. Defaults to min(num_samples, 64).
+        noise: Optional[torch.Tensor]
+            Optional latent noise tensor. When provided, its first dimension defines
+            the number of samples, making `num_samples` ignored.
+        denormalize: bool
+            Whether to map outputs from [-1, 1] back to [0, 1].
+        return_on_cpu: bool
+            If True (default) the returned tensor resides on CPU memory.
+
+        Returns
+        -------
+        torch.Tensor
+            Generated images with shape (N, C, H, W).
+        """
+        if noise is not None:
+            total_samples = noise.size(0)
+            if total_samples <= 0:
+                raise ValueError("Provided noise tensor must contain at least one sample.")
+            num_samples = total_samples
+        else:
+            if num_samples <= 0:
+                raise ValueError("num_samples must be a positive integer when noise is not provided.")
+
+        batch_size = batch_size or min(num_samples, 64)
+        if batch_size <= 0:
+            raise ValueError("batch_size must resolve to a positive integer.")
+
+        outputs: List[torch.Tensor] = []
+        was_training = self.generator.training
+        self.generator.eval()
+
+        try:
+            with torch.no_grad():
+                produced = 0
+                while produced < num_samples:
+                    current_batch = min(batch_size, num_samples - produced)
+
+                    if noise is not None:
+                        noise_batch = noise[produced : produced + current_batch]
+                    else:
+                        noise_batch = self._sample_generator_noise(current_batch)
+
+                    fake_images = self._generate_from_noise(noise_batch).detach()
+
+                    if denormalize:
+                        fake_images = fake_images.add(1).div(2).clamp(0, 1)
+
+                    if return_on_cpu:
+                        outputs.append(fake_images.cpu())
+                    else:
+                        outputs.append(fake_images)
+
+                    produced += current_batch
+        finally:
+            if was_training:
+                self.generator.train()
+
+        return torch.cat(outputs, dim=0)
 
     def plot_history(self) -> None:
         metrics = self.history.as_dict()

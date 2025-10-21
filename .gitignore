@@ -1,3 +1,6 @@
 app/data/img/*
 !app/data/img/.gitkeep
 __pycache__
+
+
+.python-version
